@@ -1,0 +1,65 @@
+# Builds MinIO from source for a release tag (upstream no longer publishes images/binaries).
+# Lives on a branch off RELEASE.2025-02-28T09-55-16Z; build from that checkout:
+#   docker buildx build -f Dockerfile.minervia --platform linux/amd64,linux/arm64 \
+#     -t ghcr.io/minervia-medical/minio:RELEASE.2025-02-28T09-55-16Z --push .
+
+# Compile natively on the build host and cross-compile for TARGETARCH (no QEMU for the Go build).
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS build
+
+ARG TARGETARCH
+ARG RELEASE=RELEASE.2025-02-28T09-55-16Z
+ARG VERSION=2025-02-28T09:55:16Z
+ARG COMMIT=8c2c92f7afdc8386b000c0cb57ecec2ee1f5bcb0
+# mc release current at the time of the minio release; needed for `mc ready local` healthchecks.
+ARG MC_RELEASE=RELEASE.2025-02-21T16-00-46Z
+
+RUN apk add -U --no-cache ca-certificates
+
+# go install puts cross-compiled binaries under bin/linux_$TARGETARCH, native ones directly in bin.
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go install -tags kqueue -trimpath -ldflags "-s -w" \
+      github.com/minio/mc@${MC_RELEASE} && \
+    mkdir -p /out && (mv /go/bin/linux_${TARGETARCH}/mc /out/mc 2>/dev/null || mv /go/bin/mc /out/mc)
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+
+# Same flags buildscripts/gen-ldflags.go would emit; it needs .git, which .dockerignore excludes.
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -tags kqueue -trimpath \
+    -ldflags "-s -w \
+      -X github.com/minio/minio/cmd.Version=${VERSION} \
+      -X github.com/minio/minio/cmd.CopyrightYear=2025 \
+      -X github.com/minio/minio/cmd.ReleaseTag=${RELEASE} \
+      -X github.com/minio/minio/cmd.CommitID=${COMMIT} \
+      -X github.com/minio/minio/cmd.ShortCommitID=${COMMIT:0:12}" \
+    -o /out/minio
+
+FROM registry.access.redhat.com/ubi9/ubi-micro:latest
+
+ARG RELEASE=RELEASE.2025-02-28T09-55-16Z
+
+LABEL org.opencontainers.image.source="https://github.com/Minervia-medical/minio" \
+      org.opencontainers.image.version="${RELEASE}" \
+      org.opencontainers.image.description="MinIO ${RELEASE} built from source by Minervia (unofficial)" \
+      org.opencontainers.image.licenses="AGPL-3.0"
+
+ENV MINIO_ACCESS_KEY_FILE=access_key \
+    MINIO_SECRET_KEY_FILE=secret_key \
+    MINIO_ROOT_USER_FILE=access_key \
+    MINIO_ROOT_PASSWORD_FILE=secret_key \
+    MINIO_KMS_SECRET_KEY_FILE=kms_master_key \
+    MINIO_CONFIG_ENV_FILE=config.env \
+    MC_CONFIG_DIR=/tmp/.mc
+
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=build --chmod=755 /out/minio /out/mc /usr/bin/
+COPY --chmod=755 dockerscripts/docker-entrypoint.sh /usr/bin/docker-entrypoint.sh
+COPY CREDITS /licenses/CREDITS
+COPY LICENSE /licenses/LICENSE
+
+EXPOSE 9000
+VOLUME ["/data"]
+
+ENTRYPOINT ["/usr/bin/docker-entrypoint.sh"]
+CMD ["minio"]
